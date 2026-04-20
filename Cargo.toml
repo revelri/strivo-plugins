@@ -17,7 +17,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Host types + Plugin trait
-strivo-core = { path = "../StriVo" }
+strivo-core = { path = ".." }
 
 # Shared with host
 ratatui = "0.30"
