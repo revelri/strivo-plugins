@@ -1,0 +1,46 @@
+[package]
+name = "strivo-plugins"
+version = "0.3.0"
+edition = "2021"
+description = "First-party plugins for StriVo (Crunchr transcription, Archiver gallery)"
+authors = ["revelri <slrevoy@mailbox.org>"]
+license = "MIT"
+repository = "https://github.com/revelri/strivo-plugins"
+homepage = "https://github.com/revelri/strivo-plugins"
+readme = "README.md"
+keywords = ["strivo", "plugin", "transcription", "whisper"]
+categories = ["command-line-utilities", "multimedia"]
+rust-version = "1.75"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Host types + Plugin trait
+strivo-core = { path = "../StriVo" }
+
+# Shared with host
+ratatui = "0.30"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "cookies", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+image = "0.25"
+
+# Plugin-only
+rusqlite = { version = "0.33", features = ["bundled"] }
+rust-stemmers = "1.2"
+unicode-segmentation = "1.12"
+base64 = "0.22"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+opt-level = 3
