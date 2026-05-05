@@ -79,6 +79,13 @@ pub struct CrunchrPlugin {
     pub picker: PickerState,
     /// Cached channel list for the config modal tandem checkboxes.
     pub cached_channels: Vec<(String, String)>, // (channel_key "Platform:id", display_name)
+
+    /// Recording IDs that should transcribe with the diarization-capable
+    /// fallback backend instead of the configured one. Populated when a
+    /// crunchr-auto job arrives for a backend lacking diarization.
+    diarize_override_jobs: HashSet<Uuid>,
+    /// Lazily-initialized voxtral-api backend used as the diarization fallback.
+    diarize_backend: Option<Arc<dyn transcribe::TranscriptionBackend>>,
 }
 
 impl Default for CrunchrPlugin {
@@ -116,6 +123,37 @@ impl CrunchrPlugin {
             view: CrunchrView::Search,
             picker: PickerState::default(),
             cached_channels: Vec::new(),
+            diarize_override_jobs: HashSet::new(),
+            diarize_backend: None,
+        }
+    }
+
+    /// If `recording_id` should transcribe with the diarization fallback,
+    /// return a clone of that backend; otherwise None. Caller falls back to
+    /// `self.backend` when this returns None.
+    fn pick_backend_for(&self, recording_id: Uuid) -> Option<Arc<dyn transcribe::TranscriptionBackend>> {
+        if self.diarize_override_jobs.contains(&recording_id) {
+            self.diarize_backend.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Lazily initialize the voxtral-api backend used as the diarization fallback.
+    /// Looks for `MISTRAL_API_KEY` (or whatever env var is configured under
+    /// `crunchr.api_key_env`). Returns true if the fallback is now usable.
+    fn try_init_diarize_backend(&mut self) -> bool {
+        if self.diarize_backend.is_some() {
+            return true;
+        }
+        let api_key = std::env::var("MISTRAL_API_KEY").ok();
+        match api_key {
+            Some(key) if !key.is_empty() => {
+                self.diarize_backend = Some(Arc::new(transcribe::voxtral_api::VoxtralApiBackend::new(key)));
+                tracing::info!("crunchr: initialized voxtral-api fallback for diarization");
+                true
+            }
+            _ => false,
         }
     }
 
@@ -240,6 +278,26 @@ impl CrunchrPlugin {
 
         self.in_flight.insert(recording_id);
 
+        // Diarization fallback: if this job came from a catalog-pull (`.crunchr-auto`
+        // marker present in the episode dir) and the configured backend doesn't
+        // support diarization, transparently switch to voxtral-api when MISTRAL_API_KEY
+        // is set. Otherwise fall through with a warning — non-diarized output is fine.
+        let auto_marker = video_path
+            .parent()
+            .map(|p| p.join(".crunchr-auto").exists())
+            .unwrap_or(false);
+        let backend_supports_diarize = self.backend.as_ref()
+            .map(|b| b.supports_diarization()).unwrap_or(false);
+        if auto_marker && !backend_supports_diarize {
+            if self.try_init_diarize_backend() {
+                self.diarize_override_jobs.insert(recording_id);
+            } else {
+                tracing::warn!(
+                    "crunchr: diarization requested for {recording_id} but no MISTRAL_API_KEY; falling back to non-diarized transcription"
+                );
+            }
+        }
+
         if let Some(conn) = self.db.as_ref() {
             if let Err(e) = db::insert_video(
                 conn,
@@ -300,8 +358,12 @@ impl CrunchrPlugin {
                 if let Some(conn) = self.db.as_ref() {
                     let _ = db::update_video_status(conn, &recording_id.to_string(), "transcribing", None);
                 }
-                // Use the TranscriptionBackend trait
-                let backend = self.backend.clone().unwrap();
+                // Per-job backend override (used when a catalog-pull job needs
+                // diarization but the configured backend can't provide it).
+                let backend = self
+                    .pick_backend_for(recording_id)
+                    .or_else(|| self.backend.clone())
+                    .unwrap();
                 vec![PluginAction::SpawnTask {
                     plugin_name: "crunchr",
                     future: Box::pin(async move {
@@ -785,8 +847,14 @@ impl CrunchrPlugin {
                     }
                 }
 
-                // Clean up WAV file
+                // Sidecar artifacts: write transcript.json, transcript.vtt, and
+                // diarization.json into the episode dir alongside video.mkv so
+                // downstream tooling doesn't need to read SQLite.
                 if let Some(job) = self.queue.iter().find(|j| j.recording_id == recording_id) {
+                    if let Some(ep_dir) = job.video_path.parent() {
+                        let _ = write_transcript_sidecars(ep_dir, &segments, &full_text);
+                    }
+                    // Clean up WAV file
                     if let Some(ref audio_path) = job.audio_path {
                         if let Err(e) = std::fs::remove_file(audio_path) {
                             tracing::debug!("Failed to clean up WAV: {e}");
@@ -1009,7 +1077,16 @@ impl Plugin for CrunchrPlugin {
                 let is_tandem = self.tandem_channels.contains(&channel_key)
                     || rec.playlist.as_ref().is_some_and(|p| self.tandem_playlists.contains(p));
 
-                if is_tandem {
+                // Catalog-pull jobs drop a `.crunchr-auto` marker in the episode dir
+                // so a one-shot `strivo pull` transcribes without editing tandem config.
+                let crunchr_auto_marker = rec
+                    .output_path
+                    .parent()
+                    .map(|p| p.join(".crunchr-auto"))
+                    .map(|m| m.exists())
+                    .unwrap_or(false);
+
+                if is_tandem || crunchr_auto_marker {
                     let video_path = rec.output_path.clone();
                     let channel_name = rec.channel_name.clone();
                     let title = rec.stream_title.clone().unwrap_or_else(|| "Untitled".to_string());
@@ -1175,4 +1252,75 @@ impl Plugin for CrunchrPlugin {
 
         lines
     }
+}
+
+/// Emit `transcript.json`, `transcript.vtt`, and `diarization.json` (when speakers
+/// are present) into the recording's parent directory. Best-effort — errors are
+/// logged but never propagated, since the SQLite write is the canonical record.
+fn write_transcript_sidecars(
+    episode_dir: &std::path::Path,
+    segments: &[types::Segment],
+    full_text: &str,
+) -> std::io::Result<()> {
+    if !episode_dir.exists() {
+        std::fs::create_dir_all(episode_dir)?;
+    }
+    // transcript.json — full structured form
+    let json = serde_json::json!({
+        "full_text": full_text,
+        "segments": segments.iter().map(|s| serde_json::json!({
+            "index": s.index,
+            "start_sec": s.start_sec,
+            "end_sec": s.end_sec,
+            "text": s.text,
+            "speaker": s.speaker,
+            "confidence": s.confidence,
+        })).collect::<Vec<_>>(),
+    });
+    std::fs::write(
+        episode_dir.join("transcript.json"),
+        serde_json::to_string_pretty(&json).unwrap_or_default(),
+    )?;
+
+    // transcript.vtt — speaker-labeled cues for any video player
+    let mut vtt = String::from("WEBVTT\n\n");
+    for s in segments {
+        let start = vtt_timestamp(s.start_sec);
+        let end = vtt_timestamp(s.end_sec);
+        vtt.push_str(&format!("{start} --> {end}\n"));
+        if let Some(spk) = s.speaker.as_deref().filter(|s| !s.is_empty()) {
+            vtt.push_str(&format!("<v {spk}>{}\n\n", s.text));
+        } else {
+            vtt.push_str(&format!("{}\n\n", s.text));
+        }
+    }
+    std::fs::write(episode_dir.join("transcript.vtt"), vtt)?;
+
+    // diarization.json — only if at least one segment carries a speaker label
+    if segments.iter().any(|s| s.speaker.is_some()) {
+        let dz = serde_json::json!(
+            segments.iter().filter_map(|s| s.speaker.as_ref().map(|spk| {
+                serde_json::json!({
+                    "start": s.start_sec,
+                    "end": s.end_sec,
+                    "speaker": spk,
+                })
+            })).collect::<Vec<_>>()
+        );
+        std::fs::write(
+            episode_dir.join("diarization.json"),
+            serde_json::to_string_pretty(&dz).unwrap_or_default(),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn vtt_timestamp(secs: f64) -> String {
+    let total_ms = (secs * 1000.0) as u64;
+    let h = total_ms / 3_600_000;
+    let m = (total_ms / 60_000) % 60;
+    let s = (total_ms / 1000) % 60;
+    let ms = total_ms % 1000;
+    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
 }
