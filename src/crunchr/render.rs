@@ -78,6 +78,7 @@ fn render_search_bar(plugin: &CrunchrPlugin, frame: &mut Frame, area: Rect) {
     let mode_label = plugin.search_mode.label();
     let mode_style = match plugin.search_mode {
         SearchMode::FullText => Style::new().fg(Theme::primary()),
+        #[cfg(feature = "semantic-search")]
         SearchMode::Semantic => Style::new().fg(Theme::secondary()),
     };
 

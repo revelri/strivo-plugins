@@ -24,16 +24,6 @@ CREATE TABLE IF NOT EXISTS videos (
     UNIQUE(channel_id, video_id)
 );
 
-CREATE TABLE IF NOT EXISTS jobs (
-    id          TEXT PRIMARY KEY,
-    channel_id  INTEGER REFERENCES channels(id),
-    state       TEXT DEFAULT 'pending',
-    total       INTEGER DEFAULT 0,
-    completed   INTEGER DEFAULT 0,
-    error       TEXT,
-    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
 CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id);
 CREATE INDEX IF NOT EXISTS idx_videos_downloaded ON videos(channel_id, downloaded);
 "#;
@@ -96,27 +86,3 @@ pub fn get_pending_videos(conn: &Connection, channel_id: i64) -> Result<Vec<(Str
     Ok(results)
 }
 
-#[allow(dead_code)]
-pub fn get_channel_stats(conn: &Connection, channel_id: i64) -> Result<(usize, usize)> {
-    let total: usize = conn.query_row(
-        "SELECT COUNT(*) FROM videos WHERE channel_id = ?1",
-        [channel_id],
-        |r| r.get(0),
-    )?;
-    let downloaded: usize = conn.query_row(
-        "SELECT COUNT(*) FROM videos WHERE channel_id = ?1 AND downloaded = TRUE",
-        [channel_id],
-        |r| r.get(0),
-    )?;
-    Ok((total, downloaded))
-}
-
-#[allow(dead_code)]
-pub fn update_job(conn: &Connection, job_id: &str, state: &str, completed: usize, error: Option<&str>) -> Result<()> {
-    conn.execute(
-        "INSERT INTO jobs (id, state, completed, error) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(id) DO UPDATE SET state = ?2, completed = ?3, error = ?4",
-        rusqlite::params![job_id, state, completed, error],
-    )?;
-    Ok(())
-}

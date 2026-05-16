@@ -167,10 +167,21 @@ pub struct Chunk {
     pub token_count: usize,
 }
 
-/// Estimate token count (~words / 0.75).
+/// Estimate token count for chunking decisions.
+///
+/// Old formula was `words / 0.75`, which only fits English prose. Code
+/// has many short tokens (closer to chars/3) and CJK/agglutinative
+/// languages tokenize by character (closer to chars/2). We take the
+/// max of a word-based and a char-based estimate so neither regime
+/// produces a wild underestimate. For exact accounting (cost tracking)
+/// we will want a real BPE tokenizer (tiktoken-rs) — that's a Crunchr
+/// M5 wedge ("Cost display for Crunchr"), not a chunking concern.
 pub fn estimate_tokens(text: &str) -> usize {
     let words = text.split_whitespace().count();
-    ((words as f64) / 0.75).ceil() as usize
+    let chars = text.chars().count();
+    let word_est = ((words as f64) * 1.3).ceil() as usize;
+    let char_est = ((chars as f64) / 3.5).ceil() as usize;
+    word_est.max(char_est)
 }
 
 /// Normalize text: collapse whitespace.
@@ -313,9 +324,20 @@ mod tests {
 
     #[test]
     fn estimate_tokens_basic() {
-        assert_eq!(estimate_tokens("hello world"), 3); // 2 words / 0.75 = 2.67 -> 3
+        // max(words*1.3, chars/3.5). "hello world": 11 chars → ceil(11/3.5)=4.
+        assert_eq!(estimate_tokens("hello world"), 4);
         assert_eq!(estimate_tokens(""), 0);
-        assert_eq!(estimate_tokens("one"), 2); // 1 / 0.75 = 1.33 -> 2
+        assert_eq!(estimate_tokens("one"), 2);
+    }
+
+    #[test]
+    fn estimate_tokens_code_and_cjk() {
+        // Code-shaped text — char-based estimate dominates.
+        let code = "fn(){let x=1;return x+1;}";
+        assert!(estimate_tokens(code) >= code.len() / 4);
+        // CJK — no spaces, so char_est carries the load.
+        let cjk = "今日は良い天気ですね";
+        assert!(estimate_tokens(cjk) >= 2);
     }
 
     #[test]

@@ -367,17 +367,46 @@ impl CrunchrPlugin {
                 vec![PluginAction::SpawnTask {
                     plugin_name: "crunchr",
                     future: Box::pin(async move {
-                        match backend.transcribe(&audio_path).await {
-                            Ok(result) => Box::new(PipelineEvent::TranscriptionComplete {
-                                recording_id,
-                                segments: result.segments,
-                                full_text: result.full_text,
-                            }) as Box<dyn Any + Send>,
-                            Err(e) => Box::new(PipelineEvent::StageError {
-                                recording_id,
-                                error: format!("Transcription failed: {e}"),
-                            }) as Box<dyn Any + Send>,
+                        // Retry transient transcription errors. Three
+                        // attempts with 5 / 10 / 30 s backoff matches the
+                        // ROADMAP M1 brief; a single API timeout no
+                        // longer kills the whole job.
+                        const BACKOFFS_SECS: [u64; 3] = [5, 10, 30];
+                        let mut last_err: Option<String> = None;
+                        for (attempt, secs) in BACKOFFS_SECS.iter().enumerate() {
+                            match backend.transcribe(&audio_path).await {
+                                Ok(result) => {
+                                    return Box::new(PipelineEvent::TranscriptionComplete {
+                                        recording_id,
+                                        segments: result.segments,
+                                        full_text: result.full_text,
+                                    }) as Box<dyn Any + Send>;
+                                }
+                                Err(e) => {
+                                    let msg = format!("{e}");
+                                    tracing::warn!(
+                                        recording_id = %recording_id,
+                                        attempt = attempt + 1,
+                                        error = %msg,
+                                        "transcription attempt failed; retrying"
+                                    );
+                                    last_err = Some(msg);
+                                    if attempt + 1 < BACKOFFS_SECS.len() {
+                                        tokio::time::sleep(
+                                            std::time::Duration::from_secs(*secs),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
                         }
+                        Box::new(PipelineEvent::StageError {
+                            recording_id,
+                            error: format!(
+                                "Transcription failed after 3 attempts: {}",
+                                last_err.unwrap_or_else(|| "unknown".into())
+                            ),
+                        }) as Box<dyn Any + Send>
                     }),
                 }]
             }
