@@ -1051,10 +1051,11 @@ impl Plugin for CrunchrPlugin {
         Ok(())
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> anyhow::Result<()> {
         self.db.take();
         self.backend.take();
         tracing::info!("CrunchR plugin shutting down");
+        Ok(())
     }
 
     fn event_filter(&self) -> Option<Vec<DaemonEventKind>> {

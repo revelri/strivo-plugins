@@ -586,9 +586,10 @@ impl Plugin for ArchiverPlugin {
         Ok(())
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> anyhow::Result<()> {
         self.db.take();
         tracing::info!("Archiver plugin shutting down");
+        Ok(())
     }
 
     fn event_filter(&self) -> Option<Vec<DaemonEventKind>> {
