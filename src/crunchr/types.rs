@@ -138,6 +138,7 @@ pub struct SearchResult {
     pub channel_name: String,
     pub snippet: String,
     pub start_sec: f64,
+    pub end_sec: f64,
     pub score: f64,
     pub video_path: Option<String>,
 }
@@ -168,6 +169,13 @@ pub enum PipelineEvent {
     StageError {
         recording_id: Uuid,
         error: String,
+    },
+    /// M5.1 — clip export finished. `path` is the resulting MKV file.
+    /// `error` is set when ffmpeg failed; the plugin surfaces the
+    /// message as last_error so the user sees what went wrong.
+    ClipExportComplete {
+        path: PathBuf,
+        error: Option<String>,
     },
 }
 

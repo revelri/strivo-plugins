@@ -198,7 +198,7 @@ pub fn fts_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Se
     let safe_query = sanitize_fts_query(query);
 
     let mut stmt = conn.prepare(
-        "SELECT c.id, v.title, v.channel_name, snippet(chunks_fts, 0, '>>>', '<<<', '...', 40), c.start_sec, rank, v.video_path
+        "SELECT c.id, v.title, v.channel_name, snippet(chunks_fts, 0, '>>>', '<<<', '...', 40), c.start_sec, c.end_sec, rank, v.video_path
          FROM chunks_fts
          JOIN chunks c ON c.id = chunks_fts.rowid
          JOIN videos v ON v.id = c.video_id
@@ -214,8 +214,9 @@ pub fn fts_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Se
             channel_name: row.get(2)?,
             snippet: row.get(3)?,
             start_sec: row.get(4)?,
-            score: row.get::<_, f64>(5)?.abs(),
-            video_path: row.get(6)?,
+            end_sec: row.get(5)?,
+            score: row.get::<_, f64>(6)?.abs(),
+            video_path: row.get(7)?,
         })
     })?
     .collect::<Result<Vec<_>, _>>()?;

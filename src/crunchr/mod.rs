@@ -29,6 +29,91 @@ use types::{
 
 pub const PANE_ID: PaneId = "crunchr";
 
+/// Sanitize a string for use in a filename — strip path separators,
+/// control chars, and characters Windows hates. Spaces collapse to
+/// underscores so users can shell-tab-complete the output.
+fn sanitize_for_filename(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else if c.is_whitespace() {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("clip");
+    }
+    out
+}
+
+/// Format a seek position as `HHhMMmSSs` for use in a filename.
+fn format_timestamp(secs: f64) -> String {
+    let total = secs.max(0.0) as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else {
+        format!("{m:02}m{s:02}s")
+    }
+}
+
+/// Disambiguate a target path that already exists. Matches the
+/// convention used by `recording::build_output_path` so users see one
+/// rule across the codebase.
+fn disambiguate(target: &std::path::Path) -> PathBuf {
+    if !target.exists() {
+        return target.to_path_buf();
+    }
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = target.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+    let ext = target.extension().and_then(|s| s.to_str()).unwrap_or("mkv");
+    for n in 1..=999u32 {
+        let candidate = parent.join(format!("{stem}_{n}.{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!("{stem}_{}.{ext}", uuid::Uuid::new_v4()))
+}
+
+/// Spawn `ffmpeg -ss <start> -to <end> -c copy <source> <dest>`. No
+/// re-encode, sub-second elapsed for any reasonable clip length. The
+/// container is matroska so we don't care about mp4-style atoms.
+async fn export_clip(
+    source: &std::path::Path,
+    start: f64,
+    end: f64,
+    clips_dir: &std::path::Path,
+    stem: &str,
+) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(clips_dir)?;
+    let initial = clips_dir.join(format!("{stem}.mkv"));
+    let dest = disambiguate(&initial);
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-ss",
+            &format!("{start:.3}"),
+            "-to",
+            &format!("{end:.3}"),
+            "-i",
+        ])
+        .arg(source)
+        .args(["-c", "copy", "-avoid_negative_ts", "make_zero"])
+        .arg(&dest)
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg exited with status {status}");
+    }
+    Ok(dest)
+}
+
 /// Number of static config fields in the Crunchr config modal (before channel checklist).
 /// Fields: enabled, backend, api_key, endpoint, whisper_model, analysis_enabled = 6 fields.
 /// Channel checkboxes start at index CRUNCHR_STATIC_FIELDS (i.e., after index 5).
@@ -681,7 +766,47 @@ impl CrunchrPlugin {
             KeyCode::Enter => {
                 if let Some(result) = self.search_results.get(self.selected_result) {
                     if let Some(ref path) = result.video_path {
-                        return vec![PluginAction::PlayFile(PathBuf::from(path))];
+                        // M5.2 — Enter on a chunk seeks mpv to start_sec
+                        // so the transcript hit lands at the right point
+                        // in the recording. PluginAction::PlayFile takes
+                        // a plain PathBuf today; PlayFileAt extends it.
+                        return vec![PluginAction::PlayFileAt(
+                            PathBuf::from(path),
+                            result.start_sec,
+                        )];
+                    }
+                }
+            }
+            KeyCode::Char('x') => {
+                // M5.1 — clip export. ffmpeg -ss start -to end -c copy
+                // <recording> clips/<channel>-<HHMMSS>.mkv. Spawned as
+                // a SpawnTask future; ClipExportComplete returns.
+                if let Some(result) = self.search_results.get(self.selected_result).cloned() {
+                    if let Some(ref path) = result.video_path {
+                        let source = PathBuf::from(path);
+                        let clips_dir = crate::dirs::clips_dir();
+                        let start = result.start_sec.max(0.0);
+                        let end = result.end_sec.max(start + 1.0);
+                        let channel_slug = sanitize_for_filename(&result.channel_name);
+                        let hhmmss = format_timestamp(start);
+                        let stem = format!("{channel_slug}-{hhmmss}");
+                        return vec![PluginAction::SpawnTask {
+                            plugin_name: "crunchr",
+                            future: Box::pin(async move {
+                                let res = export_clip(&source, start, end, &clips_dir, &stem).await;
+                                let event = match res {
+                                    Ok(path) => PipelineEvent::ClipExportComplete {
+                                        path,
+                                        error: None,
+                                    },
+                                    Err(e) => PipelineEvent::ClipExportComplete {
+                                        path: clips_dir.join(format!("{stem}.mkv")),
+                                        error: Some(e.to_string()),
+                                    },
+                                };
+                                Box::new(event) as Box<dyn std::any::Any + Send>
+                            }),
+                        }];
                     }
                 }
             }
@@ -1011,6 +1136,20 @@ impl CrunchrPlugin {
                 self.last_error = Some(error.clone());
                 vec![PluginAction::SetStatus(format!("CrunchR error: {error}"))]
             }
+            PipelineEvent::ClipExportComplete { path, error } => match error {
+                None => {
+                    let label = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    vec![PluginAction::SetStatus(format!("Clip exported: {label}"))]
+                }
+                Some(e) => {
+                    self.last_error = Some(e.clone());
+                    vec![PluginAction::SetStatus(format!("Clip export failed: {e}"))]
+                }
+            },
         }
     }
 }
