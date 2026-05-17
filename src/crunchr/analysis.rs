@@ -8,6 +8,14 @@ pub struct AnalysisResult {
     pub summary: String,
     pub topics: Vec<String>,
     pub sentiment: String,
+    /// Token usage returned by the provider (`usage.prompt_tokens` etc.).
+    /// Default 0 when the provider doesn't surface them; cost_cents
+    /// stays accurate at zero in that case.
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Estimated cost in USD cents. Computed from the pricing table
+    /// in `cost.rs`; 0 for unknown models.
+    pub cost_cents: u64,
 }
 
 /// Analyze a transcript using OpenRouter's LLM API.
@@ -81,6 +89,17 @@ Respond in this exact JSON format (no markdown, just raw JSON):
 
     let parsed: serde_json::Value = response.json().await?;
 
+    // Token usage — OpenRouter mirrors the OpenAI shape:
+    // { usage: { prompt_tokens, completion_tokens, total_tokens } }.
+    let prompt_tokens = parsed["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    let completion_tokens = parsed["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    let cost_cents = super::cost::estimate_cost_cents(
+        &config.model,
+        prompt_tokens as usize,
+        completion_tokens as usize,
+    )
+    .unwrap_or(0);
+
     let content = parsed["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("{}");
@@ -118,5 +137,8 @@ Respond in this exact JSON format (no markdown, just raw JSON):
             .as_str()
             .unwrap_or("unknown")
             .to_string(),
+        prompt_tokens,
+        completion_tokens,
+        cost_cents,
     })
 }

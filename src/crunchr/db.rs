@@ -99,6 +99,18 @@ pub fn open_and_init(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     conn.execute_batch(SCHEMA)?;
+    // M5.6 — additive migration for cost tracking. ALTER TABLE ADD
+    // COLUMN is idempotent only if we check first; rusqlite returns
+    // an error on the second run, which we swallow because there's
+    // no DROP/cleanup state to roll back. Default 0 keeps existing
+    // rows valid.
+    for stmt in [
+        "ALTER TABLE videos ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE videos ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE videos ADD COLUMN cost_cents INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let _ = conn.execute(stmt, []);
+    }
     Ok(conn)
 }
 

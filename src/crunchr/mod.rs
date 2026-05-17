@@ -343,6 +343,17 @@ impl CrunchrPlugin {
             (false, None, Vec::new(), None)
         };
 
+        // M5.6 — token usage + cost columns. The columns are guaranteed
+        // present by the additive migration in db::open_and_init; default
+        // values (0) flow through for un-analyzed rows.
+        let (prompt_tokens, completion_tokens, cost_cents): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT prompt_tokens, completion_tokens, cost_cents FROM videos WHERE id = ?1",
+                [video_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap_or((0, 0, 0));
+
         Some(types::CrunchrRecordingInfo {
             status,
             segment_count,
@@ -351,6 +362,9 @@ impl CrunchrPlugin {
             summary,
             topics,
             sentiment,
+            prompt_tokens: prompt_tokens.max(0) as u64,
+            completion_tokens: completion_tokens.max(0) as u64,
+            cost_cents: cost_cents.max(0) as u64,
         })
     }
 
@@ -1075,6 +1089,9 @@ impl CrunchrPlugin {
                                             summary: result.summary,
                                             topics: topics_json,
                                             sentiment: result.sentiment,
+                                            prompt_tokens: result.prompt_tokens,
+                                            completion_tokens: result.completion_tokens,
+                                            cost_cents: result.cost_cents,
                                         }) as Box<dyn Any + Send>
                                     }
                                     Err(e) => {
@@ -1084,6 +1101,9 @@ impl CrunchrPlugin {
                                             summary: String::new(),
                                             topics: "[]".to_string(),
                                             sentiment: "unknown".to_string(),
+                                            prompt_tokens: 0,
+                                            completion_tokens: 0,
+                                            cost_cents: 0,
                                         }) as Box<dyn Any + Send>
                                     }
                                 }
@@ -1103,13 +1123,33 @@ impl CrunchrPlugin {
                 self.refresh_word_frequencies();
                 Vec::new()
             }
-            PipelineEvent::AnalysisComplete { recording_id, summary, topics, sentiment } => {
+            PipelineEvent::AnalysisComplete {
+                recording_id,
+                summary,
+                topics,
+                sentiment,
+                prompt_tokens,
+                completion_tokens,
+                cost_cents,
+            } => {
                 // Store analysis results in DB
                 if let Some(conn) = self.db.as_ref() {
                     let _ = conn.execute(
                         "INSERT OR REPLACE INTO video_analysis (video_id, summary, topics, sentiment) \
                          SELECT id, ?1, ?2, ?3 FROM videos WHERE recording_id = ?4",
                         rusqlite::params![summary, topics, sentiment, recording_id.to_string()],
+                    );
+                    // M5.6: persist token usage + cost. INSERT-OR-REPLACE
+                    // so re-analyses overwrite without piling up rows.
+                    let _ = conn.execute(
+                        "UPDATE videos SET prompt_tokens = ?1, completion_tokens = ?2, cost_cents = ?3 \
+                         WHERE recording_id = ?4",
+                        rusqlite::params![
+                            prompt_tokens as i64,
+                            completion_tokens as i64,
+                            cost_cents as i64,
+                            recording_id.to_string(),
+                        ],
                     );
                     let _ = db::update_video_status(conn, &recording_id.to_string(), "complete", None);
                 }
@@ -1416,6 +1456,30 @@ impl Plugin for CrunchrPlugin {
                 lines.push(Line::from(vec![
                     Span::styled("  Sentiment:", Style::new().fg(Theme::dim())),
                     Span::styled(format!(" {sentiment}"), Style::new().fg(color)),
+                ]));
+            }
+            // M5.6 — token usage + estimated cost. Surfaced only when
+            // analyzed because tokens are 0 otherwise; "$0.00" is
+            // technically correct but adds noise.
+            if info.prompt_tokens > 0 || info.completion_tokens > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("  Tokens:   ", Style::new().fg(Theme::dim())),
+                    Span::styled(
+                        format!(
+                            "{} in · {} out",
+                            info.prompt_tokens, info.completion_tokens
+                        ),
+                        Style::new().fg(Theme::fg()),
+                    ),
+                ]));
+            }
+            if info.cost_cents > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("  Cost:     ", Style::new().fg(Theme::dim())),
+                    Span::styled(
+                        cost::format_cents(info.cost_cents),
+                        Style::new().fg(Theme::green()),
+                    ),
                 ]));
             }
         }

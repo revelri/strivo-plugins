@@ -165,6 +165,11 @@ pub enum PipelineEvent {
         summary: String,
         topics: String,
         sentiment: String,
+        /// Token usage + estimated cost (M5.6 cost UI integration).
+        /// Zero for models not in the pricing table.
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cost_cents: u64,
     },
     StageError {
         recording_id: Uuid,
@@ -216,4 +221,10 @@ pub struct CrunchrRecordingInfo {
     pub summary: Option<String>,
     pub topics: Vec<String>,
     pub sentiment: Option<String>,
+    /// M5.6 — token usage and estimated cost in USD cents. 0 when the
+    /// recording hasn't been analyzed yet or the model is outside the
+    /// pricing table.
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cost_cents: u64,
 }
