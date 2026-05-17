@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod cost;
 mod db;
 mod pipeline;
 pub mod render;
