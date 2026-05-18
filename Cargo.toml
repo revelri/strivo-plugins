@@ -23,7 +23,7 @@ semantic-search = []
 
 [dependencies]
 # Host types + Plugin trait
-strivo-core = { path = ".." }
+strivo-core = { git = "https://github.com/Chorosyne/strivo", branch = "main" }
 
 # Shared with host
 ratatui = "0.30"
